@@ -1,5 +1,6 @@
 """Extract + incremental load of hourly weather and air-quality readings."""
 import logging
+import time
 import pandas as pd
 import requests
 from .config import CITIES, INITIAL_BACKFILL_DAYS, MAX_BACKFILL_DAYS
@@ -12,17 +13,22 @@ DDL = """CREATE TABLE IF NOT EXISTS raw_readings(
     city VARCHAR, ts TIMESTAMP, temp_c DOUBLE, humidity DOUBLE, wind_kmh DOUBLE,
     pm25 DOUBLE, pm10 DOUBLE, aqi DOUBLE, PRIMARY KEY(city, ts))"""
 
+RETRIES = 4
+TIMEOUT = 60
+
 
 def _get(url, loc, hourly, past_days):
     params = dict(latitude=loc["lat"], longitude=loc["lon"], hourly=hourly,
                   past_days=past_days, forecast_days=1, timezone="Asia/Kolkata")
-    for attempt in range(3):
+    for attempt in range(RETRIES):
         try:
-            r = requests.get(url, params=params, timeout=30)
+            r = requests.get(url, params=params, timeout=TIMEOUT)
             r.raise_for_status()
             return pd.DataFrame(r.json()["hourly"])
         except requests.RequestException as e:
-            log.warning("retry %s for %s: %s", attempt + 1, url, e)
+            wait = 5 * 2 ** attempt  # exponential backoff: 5s, 10s, 20s, 40s
+            log.warning("retry %s/%s for %s: %s (waiting %ss)", attempt + 1, RETRIES, url, e, wait)
+            time.sleep(wait)
     raise RuntimeError(f"API failed after retries: {url}")
 
 
@@ -56,11 +62,20 @@ def load(con, df):
 
 
 def run(con):
+    """Load each city independently; one bad city must not kill the whole run."""
     con.execute(DDL)
-    total = 0
+    total, failed = 0, []
     for name, loc in CITIES.items():
-        days = backfill_days(con, name)
-        n = load(con, fetch_city(name, loc, days))
-        log.info("%s: loaded %d rows (past_days=%d)", name, n, days)
-        total += n
+        try:
+            days = backfill_days(con, name)
+            n = load(con, fetch_city(name, loc, days))
+            log.info("%s: loaded %d rows (past_days=%d)", name, n, days)
+            total += n
+        except Exception as e:
+            log.error("%s: FAILED, skipping this run (%s)", name, e)
+            failed.append(name)
+    if failed:
+        log.warning("Failed cities: %s (they will catch up on the next run)", failed)
+    if len(failed) > len(CITIES) // 2:
+        raise RuntimeError(f"Too many cities failed: {failed}")
     return total
